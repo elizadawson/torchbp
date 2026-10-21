@@ -1707,6 +1707,8 @@ def _make_image_former(
     g_extent: list | None,
     image_opts: dict | None,
     dem: Tensor | None = None,
+    rx_pos: Tensor | None = None,
+    pos_ref: Tensor | None = None,
 ):
     """Build a ``form_image(pos) -> 2D image`` closure for GPGA.
 
@@ -1715,6 +1717,13 @@ def _make_image_former(
     and DEM arguments only to algorithms that accept them, and normalizes the
     output to a bare 2D tensor.
     """
+    if rx_pos is not None:
+        if algorithm != "bp":
+            raise ValueError("bistatic autofocus currently supports algorithm='bp'; factorized BP still uses monostatic geometry")
+        if pos_ref is None or rx_pos.shape != pos_ref.shape:
+            raise ValueError("rx_pos must match the transmitter positions")
+        if any(arg is not None for arg in (att, g, g_extent)):
+            raise ValueError("bistatic autofocus does not yet support antenna-pattern weighting")
     is_polar = _grid_is_polar(grid)
     table = _GPGA_POLAR_ALGOS if is_polar else _GPGA_CART_ALGOS
     if algorithm not in table:
@@ -1751,6 +1760,9 @@ def _make_image_former(
     def form_image(p):
         kwargs = dict(opts)
         kwargs.update(d0=d0, data_fmod=data_fmod)
+        if rx_pos is not None:
+            # A common platform translation preserves the per-sweep baseline.
+            kwargs["rx_pos"] = rx_pos + (p - pos_ref)
         if accepts_antenna:
             kwargs.update(att=att, g=g, g_extent=g_extent)
         if dem is not None:
@@ -1761,6 +1773,52 @@ def _make_image_former(
         return img
 
     return form_image
+
+
+def _sweep_coordinates(sweep_times, pos):
+    if sweep_times is None:
+        return None
+    if sweep_times.shape != (len(pos),) or len(pos) < 2:
+        raise ValueError("sweep_times must contain one timestamp per sweep (at least two)")
+    t = sweep_times.to(device=pos.device, dtype=torch.float64)
+    if not torch.isfinite(t).all() or not (torch.diff(t) > 0).all():
+        raise ValueError("sweep_times must be finite and strictly increasing")
+    return (t - t[0]) / (t[-1] - t[0])
+
+
+def _interp_history(values, x, xq):
+    hi = torch.searchsorted(x.contiguous(), xq.contiguous()).clamp(1, len(x) - 1)
+    lo = hi - 1
+    w = ((xq - x[lo]) / (x[hi] - x[lo])).to(values.real.dtype)
+    return values[..., lo] * (1 - w) + values[..., hi] * w
+
+
+def _filter_history(values, window, width, coordinates):
+    if width is None or width >= values.shape[-1]:
+        return values
+    if coordinates is None:
+        return fft_lowpass_filter_window(values, window=window, window_width=width)
+    # Regrid only the geometry-compensated target histories for filtering;
+    # measured range profiles and antenna positions stay at their original times.
+    regular = torch.linspace(0, 1, len(coordinates), device=coordinates.device,
+                             dtype=coordinates.dtype)
+    uniform = _interp_history(values, coordinates, regular)
+    filtered = fft_lowpass_filter_window(uniform, window=window, window_width=width)
+    return _interp_history(filtered, regular, coordinates)
+
+
+def _detrend_history(values, weights, coordinates):
+    if coordinates is None:
+        return weighted_detrend(values, weights)
+    t = coordinates.to(values.dtype)
+    w = torch.ones_like(values) if weights is None else weights
+    if w.sum() <= 0:
+        return values
+    tm = (w * t).sum() / w.sum()
+    vm = (w * values).sum() / w.sum()
+    denom = (w * (t - tm)**2).sum()
+    slope = (w * (t - tm) * (values - vm)).sum() / denom.clamp(min=1e-30)
+    return values - vm - slope * (t - tm)
 
 
 def gpga(
@@ -1793,9 +1851,16 @@ def gpga(
     g_extent: list | None = None,
     data_fmod: float = 0,
     dem: Tensor | None = None,
+    rx_pos: Tensor | None = None,
+    sweep_times: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """
     Generalized phase gradient autofocus. [1]_
+
+    For bistatic autofocus use ``gpga_tde``: this function's phase-to-position
+    conversion retains its monostatic x-direction approximation and rejects
+    ``rx_pos``. ``sweep_times`` optionally supplies the actual acquisition times
+    for filtering and detrending.
 
     Works with any image formation algorithm in the library and with both
     polar and Cartesian grids. The grid type is detected automatically and the
@@ -1951,6 +2016,9 @@ def gpga(
         ``torchbp.util.phase_to_distance(phi, fcenter)`` is the applied
         range-direction position correction.
     """
+    if rx_pos is not None:
+        raise ValueError("use gpga_tde for bistatic autofocus; its position solve accounts for both antenna look directions")
+    coordinates = _sweep_coordinates(sweep_times, pos)
     if fcenter is None:
         fcenter = fc
     # A lazy conjugate view (e.g. data straight from fft(...).conj()) is
@@ -2017,16 +2085,14 @@ def gpga(
             beam_w = torch.sum(target_wn**2, dim=0)
         # Filter samples
         if window_width is not None and window_width < target_data.shape[1]:
-            target_data = fft_lowpass_filter_window(
-                target_data, window=lp_w, window_width=window_width
-            )
+            target_data = _filter_history(target_data, lp_w, window_width, coordinates)
         phi = pga_estimator(
             target_data, estimator, eps, weight=target_w, weight_gate=beam_gate,
             weight_norm=target_wn, weight_pair=target_wpair,
         )
         phi_sum = unwrap(phi_sum + phi)
         if remove_trend:
-            phi_sum = weighted_detrend(phi_sum, beam_w)
+            phi_sum = _detrend_history(phi_sum, beam_w, coordinates)
         # Phase to distance
         d = phi_sum * C0 / (4 * torch.pi * fcenter)
         pos_new[:, 0] = pos[:, 0] + d
@@ -2079,10 +2145,24 @@ def gpga_tde(
     coarse_window: int | None = None,
     coarse_margin: float = 2.0,
     coarse_estimate_z: bool = True,
+    rx_pos: Tensor | None = None,
+    sweep_times: Tensor | None = None,
+    rms_history: list[float] | None = None,
 ) -> tuple[Tensor, Tensor]:
     """
     Generalized phase gradient autofocus [1]_ with time-domain error (TDE) 3D
     position estimation.
+
+    ``rms_history``, when supplied, receives the coverage-weighted RMS
+    phase-equivalent position correction in radians at each iteration, before
+    the stopping check. This is a convergence metric, not true residual phase.
+
+    ``rx_pos`` enables exact bistatic geometry with ``pos`` as the transmitter
+    trajectory. The solve estimates a common platform translation for both
+    antennas. The returned positions are corrected TX positions; corrected RX
+    positions are ``rx_pos + (pos_new - pos)``. ``sweep_times`` optionally supplies
+    the actual acquisition times for filtering and detrending. See
+    ``docs/bistatic.md`` for supported options and the time-filtering convention.
 
     Works with any image formation algorithm in the library and with both
     polar and Cartesian grids (see :func:`gpga` for ``algorithm`` /
@@ -2300,6 +2380,9 @@ def gpga_tde(
     pos_new : Tensor
         Solved 3D position error.
     """
+    coordinates = _sweep_coordinates(sweep_times, pos)
+    if rx_pos is not None and coarse_window is not None:
+        raise ValueError("bistatic GPGA does not yet support the monostatic coarse-aspect projection")
     if fcenter is None:
         fcenter = fc
     # A lazy conjugate view (e.g. data straight from fft(...).conj()) is
@@ -2318,7 +2401,7 @@ def gpga_tde(
 
     form_image = _make_image_former(
         algorithm, grid, data, fc, r_res, d0, data_fmod,
-        att, g, g_extent, image_opts, dem,
+        att, g, g_extent, image_opts, dem, rx_pos, pos,
     )
 
     pos_new = pos.clone()
@@ -2364,7 +2447,7 @@ def gpga_tde(
         dtype=torch.float32,
         device=data.device,
     )
-    h = torch.mean(pos[:, 2])
+    h = torch.mean(pos[:, 2] if rx_pos is None else (pos[:, 2] + rx_pos[:, 2]) / 2)
 
     if h == 0:
         estimate_z = False
@@ -2427,6 +2510,7 @@ def gpga_tde(
                     d0,
                     interp_method=interp_method,
                     data_fmod=data_fmod,
+                    rx_pos=None if rx_pos is None else rx_pos + (pos_new - pos),
                 )
                 target_w = None
                 target_wn = None
@@ -2443,9 +2527,7 @@ def gpga_tde(
                     target_data = target_data * (awn > beam_gate)
                 # Filter samples
                 if window_width is not None and window_width < target_data.shape[1]:
-                    target_data = fft_lowpass_filter_window(
-                        target_data, window=lp_w, window_width=window_width
-                    )
+                    target_data = _filter_history(target_data, lp_w, window_width, coordinates)
                 phi, w = pga_estimator(
                     target_data, "wls", eps, return_weight=True,
                     weight=target_w, weight_gate=beam_gate,
@@ -2474,7 +2556,7 @@ def gpga_tde(
                 if coarse_iter:
                     phi = _project_aspect_mode(phi, target_pos, pos_new, beam_w)
                 phi = unwrap(phi)
-                phi = weighted_detrend(phi, beam_w)
+                phi = _detrend_history(phi, beam_w, coordinates)
                 # Phase to distance
                 d = phi * C0 / (4 * torch.pi * fcenter)
                 local_d[ir * azimuth_divisions + jr, :] = d
@@ -2544,6 +2626,15 @@ def gpga_tde(
         else:
             m = torch.stack([cos_az * cos_el, sin_az * cos_el], dim=-1)
 
+        if rx_pos is not None:
+            # The derivative of equivalent range is the mean of the TX and
+            # RX look vectors, not the look vector of their midpoint.
+            from .ops.bistatic import _bistatic_look_vectors
+            receiver = rx_pos + (pos_new - pos)
+            m = _bistatic_look_vectors(local_centers, pos_new, receiver)
+            if not est_z:
+                m = m[..., :2]
+
         w = torch.sqrt(local_w).transpose(0, 1).unsqueeze(-1)  # [nsweeps, nblocks, 1]
         w = w / torch.clamp(torch.max(w), min=1e-12)
         s = local_d.unsqueeze(0).transpose(0, 2)
@@ -2580,9 +2671,8 @@ def gpga_tde(
         coverage = torch.sum(local_w, dim=0)
         coverage_sum = torch.clamp(torch.sum(coverage), min=1e-12)
         if remove_trend:
-            d_solved[0] = weighted_detrend(
-                d_solved[0], coverage if use_antenna_weight else None
-            )
+            d_solved[0] = _detrend_history(
+                d_solved[0], coverage if use_antenna_weight else None, coordinates)
         rms_error = (
             4
             * torch.pi
@@ -2591,6 +2681,8 @@ def gpga_tde(
                 / coverage_sum
             ).item()
         )
+        if rms_history is not None:
+            rms_history.append(rms_error)
         if verbose:
             stage = " (coarse)" if coarse_iter else ""
             print(f"{i+1}, {window_width}, {rms_error}{stage}")

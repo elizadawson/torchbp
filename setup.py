@@ -159,6 +159,9 @@ setup(
     name=library_name,
     version="0.0.1",
     packages=find_packages(),
+    # Use a path-based editable install so the outer checkout directory does
+    # not shadow this package when importing from the parent repository.
+    package_dir={"": "."},
     ext_modules=get_extensions(),
     install_requires=["torch", "numpy", "scipy"],
     extras_require = {

@@ -167,6 +167,7 @@ def backprojection_polar_2d(
     normalize: bool = True,
     dem: Tensor | None = None,
     interp_method: "str | tuple" = "linear",
+    rx_pos: Tensor | None = None,
 ) -> Tensor:
     """
     2D backprojection with pseudo-polar coordinates.
@@ -201,6 +202,12 @@ def backprojection_polar_2d(
         and oversample is FFT oversampling factor.
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
+        With ``rx_pos``, this is the transmitter position, shape [nsweeps, 3].
+    rx_pos : Tensor or None
+        Receiver position per sweep. Enables exact bistatic geometry:
+        range bins use (R_tx + R_rx)/2 and carrier phase uses R_tx + R_rx.
+        Currently supports unbatched input, linear interpolation, and no
+        antenna-pattern weighting or image dealiasing. None keeps monostatic BP.
     d0 : float
         Zero range correction.
     dealias : bool
@@ -261,6 +268,13 @@ def backprojection_polar_2d(
     """
     data = _materialize(data)
     interp_method = parse_interp_method(interp_method)
+    if rx_pos is not None:
+        if interp_method[0] != "linear" or dealias or alias_fmod != 0 or any(
+                arg is not None for arg in (att, g, g_extent)):
+            raise ValueError("bistatic polar BP currently supports linear interpolation without antenna weighting or dealiasing")
+        from .bistatic import _backprojection_bistatic
+        return _backprojection_bistatic(data, grid, fc, r_res, pos, rx_pos,
+                                        d0, data_fmod, polar=True, dem=dem)
     if interp_method[0] != "linear":
         if torch.is_grad_enabled() and (data.requires_grad or pos.requires_grad):
             raise ValueError(
@@ -558,7 +572,8 @@ def backprojection_cart_2d(
     pos: Tensor,
     d0: float = 0.0,
     beamwidth: float = torch.pi,
-    data_fmod: float = 0
+    data_fmod: float = 0,
+    rx_pos: Tensor | None = None,
 ) -> Tensor:
     """
     2D backprojection with cartesian coordinates.
@@ -588,6 +603,10 @@ def backprojection_cart_2d(
         and oversample is FFT oversampling factor.
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3].
+        With ``rx_pos``, this is the transmitter position.
+    rx_pos : Tensor or None
+        Receiver position per sweep, shape [nsweeps, 3]. Enables exact
+        bistatic BP for unbatched input with the default beamwidth.
     beamwidth : float
         Beamwidth of the antenna in radians. Points outside the beam are not calculated.
     d0 : float
@@ -601,6 +620,12 @@ def backprojection_cart_2d(
         Cartesian format radar image.
     """
     data = _materialize(data)
+    if rx_pos is not None:
+        if beamwidth != torch.pi:
+            raise ValueError("bistatic Cartesian BP does not yet support beamwidth gating")
+        from .bistatic import _backprojection_bistatic
+        return _backprojection_bistatic(data, grid, fc, r_res, pos, rx_pos,
+                                        d0, data_fmod)
     cpp_args = _prepare_backprojection_cart_2d_args(
         data, grid, fc, r_res, pos, d0, beamwidth, data_fmod
     )
@@ -854,7 +879,8 @@ def gpga_backprojection_2d_core(
     r_res: float,
     d0: float = 0.0,
     interp_method: str = "linear",
-    data_fmod: float = 0
+    data_fmod: float = 0,
+    rx_pos: Tensor | None = None,
 ) -> Tensor:
     """
     Generalized phase gradient autofocus.
@@ -868,6 +894,10 @@ def gpga_backprojection_2d_core(
         Range compressed input data. Shape should be [nsweeps, samples].
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3].
+        With ``rx_pos``, this is the transmitter position.
+    rx_pos : Tensor or None
+        Receiver position per sweep. Enables exact bistatic target histories
+        with linear interpolation. None retains the monostatic implementation.
     fc : float
         Phase reference frequency of the range-compressed data in Hz, not
         necessarily the RF center frequency. See
@@ -904,7 +934,8 @@ def gpga_backprojection_2d_core(
             i1 = min(i0 + chunk, nsweeps)
             outs.append(gpga_backprojection_2d_core(
                 target_pos, data[i0:i1].load(), pos[i0:i1], fc, r_res,
-                d0=d0, interp_method=interp_method, data_fmod=data_fmod))
+                d0=d0, interp_method=interp_method, data_fmod=data_fmod,
+                rx_pos=None if rx_pos is None else rx_pos[i0:i1]))
         return torch.cat(outs, dim=1)
 
     nsweeps = data.shape[0]
@@ -915,6 +946,12 @@ def gpga_backprojection_2d_core(
 
     interp_method = parse_interp_method(
         interp_method, allowed=("linear", "lanczos"))
+    if rx_pos is not None:
+        if interp_method[0] != "linear":
+            raise ValueError("bistatic GPGA currently supports linear interpolation")
+        from .bistatic import _bistatic_samples
+        return _bistatic_samples(target_pos, data, pos, rx_pos, fc, r_res,
+                                  d0, data_fmod)
     if interp_method[0] == "linear":
         return torch.ops.torchbp.gpga_backprojection_2d.default(
             target_pos, data, pos, sweep_samples, nsweeps, fc, r_res, ntargets, d0, data_fmod
