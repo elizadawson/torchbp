@@ -24,3 +24,6 @@ docs/build/
 examples/*.png
 examples/*.p
 examples/*.safetensors
+
+# macOS Finder metadata
+.DS_Store
